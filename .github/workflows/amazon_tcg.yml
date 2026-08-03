@@ -1,0 +1,49 @@
+name: Amazon TCG Deal Finder
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:          # bouton manuel — recommandé (voir README, IP datacenter)
+  schedule:
+    # 2×/jour. Volontairement rare : Amazon bloque agressivement les IP
+    # datacenter (celles de GitHub Actions), inutile de marteler.
+    - cron: "0 8,18 * * *"
+
+# Évite deux runs concurrents qui commiteraient les CSV en même temps
+concurrency:
+  group: amazon-tcg
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps + Chromium
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Scan FR/DE/ES/IT + rapport
+        env:
+          HEADLESS:           "1"
+          MAX_PAGES:          "4"
+          TELEGRAM_TOKEN_2:   ${{ secrets.TELEGRAM_TOKEN_2 }}
+          TELEGRAM_CHAT_ID_2: ${{ secrets.TELEGRAM_CHAT_ID_2 }}
+        run: python run_amazon_tcg.py
+
+      - name: Commit CSV + rapport si changement
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "actions@github.com"
+          git add amazon_tcg_*_raw.csv index.html
+          git diff --cached --quiet && exit 0
+          git commit -m "amazon tcg scan $(date -u +'%Y-%m-%d %H:%M')"
+          git push
