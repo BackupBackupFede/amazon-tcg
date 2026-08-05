@@ -45,7 +45,11 @@ MIN_PRICE = 20.0     # sous ce prix : boosters à l'unité / accessoires
 # Deal cross-marché : le moins cher doit être nettement sous la médiane des autres
 ARB_MIN_PCT = 0.12
 ARB_MIN_EUR = 12
-ARB_TIERS   = ("display", "case", "etb", "coffret")
+# On ne retient QUE les displays (boîtes de boosters) et les cases (cartons de
+# displays). Ni cartes à l'unité, ni ETB, ni coffrets/petits packs. Pour
+# réélargir un jour : ajoute "etb" et/ou "coffret" ici.
+KEEP_TIERS = ("display", "case")
+ARB_TIERS  = KEEP_TIERS
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -65,9 +69,11 @@ TIER_RULES = [
                   r"top[\s-]?trainer", r"allenatore"]),
     ("coffret",  [r"\bcoffret\b", r"\bbundle\b", r"\btin\b", r"collection box",
                   r"premium collection", r"lot de \d+\s*boosters"]),
-    ("display",  [r"\bdisplay\b", r"bo[iî]te de \d+\s*boosters", r"\b\d+\s*boosters\b",
-                  r"booster\s*box", r"boosterbox", r"36\s*(pack|booster)",
-                  r"pr[eé]sentoir"]),
+    # Un display = 18/24/36 boosters. On exige un compte à 2 chiffres (10-36)
+    # pour ne PAS confondre avec les mini-boîtes "4 boosters + 1 carte".
+    ("display",  [r"\bdisplay\b", r"pr[eé]sentoir", r"booster\s*box", r"boosterbox",
+                  r"bo[iî]te de (1[0-9]|2[0-9]|3[0-6])\s*boosters",
+                  r"\b(1[0-9]|2[0-9]|3[0-6])\s*boosters\b", r"36\s*(pack|booster)"]),
     ("booster",  [r"\bbooster\b", r"\bsobre\b", r"\bbustina\b"]),
 ]
 
@@ -86,12 +92,17 @@ def detect_game(title):
 
 # Bruit : accessoires, singles, produits ouverts, versions JP/CN/KR
 _NOISE_RE = re.compile(r"""(?ix)
-    sleeve|prot[eè]ge|protection|protective|schutz|classeur|binder|portfolio|
+    sleeve|prot[eè]ge|protection|protective|protector|schutz|classeur|binder|portfolio|
     toploader|deck\s*box|playmat|tapis|acryl|plexi|magnetic|vitrine|
     display\s*case|card\s*case|
+    funko|puzzle|figurine|figuren|peluche|plush|porte[\s-]?cl[eé]|
+    sticker|autocollant|checklane|ravensburger|play\s*['’]?\s*n['’]?\s|
+    \(\s*[1-6]\s*boosters|
     \bsingle\b|carte\s*[àa]\s*l['’ ]?unit|lot\s*de\s*\d+\s*cartes|
-    japonais|japanese|\(jp\)|\bjp\b|
-    chinois|chinoise|chinese|version\s*ch\b|cor[ée]en|coreano|korean
+    coffret\s*de\s*\d+\s*cartes|ultraboost|secr[eè]te|special\s*art|
+    \b(?:op|eb|prb|st|ev|sv)\d{1,2}-\d{2,3}\b|          # n° de carte (OP06-119)
+    japonais|japanese|giappones\w*|japanisch|japon[ée]s\w*|\(jp\)|\bjp\b|
+    chinois|chinoise|chinese|cinese|chinesisch|version\s*ch\b|cor[ée]en|coreano|korean
 """)
 
 ALLOWED_LANGS = ["(en)", "- en", "_en"]
@@ -231,12 +242,18 @@ def scrape_amazon(market: str, max_pages=MAX_PAGES) -> list[dict]:
                         if not game or is_noise(title, game):
                             continue
                         tier = classify_tier(title)
-                        if tier == "other" or tier == "booster":
+                        if tier not in KEEP_TIERS:
                             continue
-                        price = normalize_price(
-                            safe_get_text(item, ["span.a-price span.a-offscreen"]))
+                        # prix courant = a-price NON barré ; prix barré = a-text-price
+                        price = normalize_price(safe_get_text(item, [
+                            "span.a-price:not(.a-text-price) span.a-offscreen",
+                            "span.a-price span.a-offscreen"]))
                         if price is None or price < MIN_PRICE:
                             continue
+                        old_price = normalize_price(safe_get_text(item, [
+                            "span.a-price.a-text-price span.a-offscreen",
+                            "span.a-price[data-a-strike='true'] span.a-offscreen"]))
+                        promo = bool(old_price and old_price > price)
                         href = safe_get_attr(item, ["h2 a", "a.a-link-normal[href*='/dp/']"])
                         rows.append({
                             "market":   mkt,
@@ -246,7 +263,8 @@ def scrape_amazon(market: str, max_pages=MAX_PAGES) -> list[dict]:
                             "asin":     item.get_attribute("data-asin") or "",
                             "title":    title,
                             "price":    price,
-                            "promo":    has_strike(item),
+                            "old_price": old_price if promo else "",
+                            "promo":    promo,
                             "url":      cfg["base_url"] + href if href else "",
                         })
                     except Exception:
@@ -269,7 +287,7 @@ def scrape_amazon(market: str, max_pages=MAX_PAGES) -> list[dict]:
 
 
 # ─── I/O ─────────────────────────────────────────────────────────────────────
-FIELDS = ["market", "game", "set_code", "tier", "asin", "title", "price", "promo", "url"]
+FIELDS = ["market", "game", "set_code", "tier", "asin", "title", "price", "old_price", "promo", "url"]
 
 
 def save_raw(rows, path):
@@ -288,6 +306,7 @@ def load_all():
         with open(path, encoding="utf-8") as f:
             for r in csv.DictReader(f):
                 r["price"] = float(r["price"]) if r["price"] else None
+                r["old_price"] = float(r["old_price"]) if r.get("old_price") else None
                 r["promo"] = r["promo"] in ("True", "true", "1")
                 rows.append(r)
     return rows
@@ -325,35 +344,117 @@ def find_deals(rows):
 
 # ─── RAPPORT ─────────────────────────────────────────────────────────────────
 def generate_report(rows):
-    deals = find_deals(rows)
-    promos = [r for r in rows if r["promo"] and r["price"]]
-    lignes = []
-    for d in deals:
-        lignes.append(
-            f"<tr class='deal'><td>{d['game']}</td><td>{d['set_code']}</td><td>{d['tier']}</td>"
-            f"<td><b>{d['market']} {d['price']:.2f}€</b></td><td>−{d['spread_pct']}% "
-            f"(méd. {d['ref_price']:.2f}€)</td><td>{d['compare']}</td>"
-            f"<td><a href='{d['url']}' target='_blank'>{d['title'][:70]}</a></td></tr>")
-    html = f"""<!doctype html><html lang="fr"><head><meta charset="utf-8">
-<title>Amazon TCG — Deals cross-marché</title><style>
-body{{font-family:system-ui,sans-serif;margin:1.2rem;background:#0f1115;color:#e6e6e6}}
-h1{{font-size:1.3rem}} .sub{{color:#9aa}} table{{border-collapse:collapse;width:100%;margin-top:1rem}}
-td,th{{border-bottom:1px solid #2a2f3a;padding:.45rem .6rem;font-size:.9rem;text-align:left}}
-tr.deal td:nth-child(4){{color:#7CFC98}} a{{color:#7db3ff;text-decoration:none}}
-input{{padding:.4rem;margin-top:.6rem;width:100%;background:#171a21;border:1px solid #2a2f3a;color:#e6e6e6}}
-</style></head><body>
-<h1>Amazon TCG — arbitrage cross-marché (One Piece + Pokémon)</h1>
-<div class="sub">{len(rows)} produits scellés · {len(deals)} deals cross-marché · {len(promos)} en promo · maj {time.strftime('%Y-%m-%d %H:%M')}</div>
-<input id="q" placeholder="🔍 filtrer (set, jeu, marché…)" oninput="flt()">
-<table id="t"><thead><tr><th>Jeu</th><th>Set</th><th>Tier</th><th>Moins cher</th>
-<th>Écart</th><th>Comparatif marchés</th><th>Produit</th></tr></thead>
-<tbody>{''.join(lignes) or '<tr><td colspan=7>Aucun deal cross-marché ce run.</td></tr>'}</tbody></table>
-<script>function flt(){{let q=document.getElementById('q').value.toLowerCase();
-for(let r of document.querySelectorAll('#t tbody tr'))r.style.display=r.innerText.toLowerCase().includes(q)?'':'none';}}</script>
-</body></html>"""
+    """Rapport local façon LEGO : grand tableau de TOUTES les offres, triable,
+    deals cross-marché surlignés (pas filtrés). Case 'deals seulement' optionnelle."""
+    import html as _html
+    deals = find_deals(rows)                       # pour l'alerte Telegram
+    promos = sum(1 for r in rows if r["promo"] and r["price"])
+
+    # Écart cross-marché par offre = médiane des AUTRES marchés du même set+tier
+    groups = {}
+    for r in rows:
+        if r["set_code"] and r["tier"] in ARB_TIERS and r["price"]:
+            groups.setdefault((r["game"], r["set_code"], r["tier"]), []).append(r)
+    info = {}
+    for offers in groups.values():
+        if len({o["market"] for o in offers}) < 2:
+            continue
+        for o in offers:
+            others = [x["price"] for x in offers if x["market"] != o["market"]]
+            if not others:
+                continue
+            ref = median(others)
+            spread = ref - o["price"]
+            info[id(o)] = (ref, (100 * spread / ref) if ref else 0,
+                           bool(spread >= ARB_MIN_EUR and ref and spread / ref >= ARB_MIN_PCT))
+
+    rows_sorted = sorted(rows, key=lambda r: (
+        r["game"], r["set_code"] or "zzz", r["tier"], r["price"] or 1e9))
+
+    tbody = ""
+    for r in rows_sorted:
+        ref, gap, is_deal = info.get(id(r), (None, None, False))
+        price = r["price"] or 0
+        price_txt = f"{price:.2f}€" if r["price"] else "—"
+        ref_txt = f"{ref:.0f}€" if ref else "—"
+        if gap is None:
+            gap_cell, gap_v = "—", 0
+        elif gap >= 0:
+            gap_cell, gap_v = f'<b style="color:#2ecc71">−{gap:.0f}%</b>', gap
+        else:
+            gap_cell, gap_v = f'<span class="dim">+{abs(gap):.0f}%</span>', gap
+        if r["promo"] and r.get("old_price") and r["price"]:
+            disc = round(100 * (r["old_price"] - r["price"]) / r["old_price"])
+            promo_cell = f'<b style="color:#f5a623">🏷️ −{disc}%</b> <span class="dim">{r["old_price"]:.0f}€</span>'
+            promo_v = disc
+        else:
+            promo_cell, promo_v = "", 0
+        title = _html.escape(r["title"] or "")[:72]
+        url = _html.escape(r["url"] or "")
+        tbody += (
+            f'<tr data-deal="{1 if is_deal else 0}"{" class=deal" if is_deal else ""}>'
+            f'<td><b>{r["set_code"] or "—"}</b></td>'
+            f'<td>{title}</td>'
+            f'<td class="dim">{r["game"]}</td>'
+            f'<td class="dim">Amazon {r["market"]}</td>'
+            f'<td class="price" data-v="{price}">{price_txt}</td>'
+            f'<td class="dim" data-v="{ref or 0}">{ref_txt}</td>'
+            f'<td data-v="{gap_v}">{gap_cell}</td>'
+            f'<td data-v="{promo_v}">{promo_cell}</td>'
+            f'<td><a href="{url}" target="_blank">Shop →</a></td></tr>')
+    if not tbody:
+        tbody = '<tr><td colspan=9 class="dim">Aucune offre — lance un scrape.</td></tr>'
+
+    heads = [("Set", 0), ("Produit", 0), ("Jeu", 0), ("Marché", 0), ("Prix", 1),
+             ("Réf", 1), ("vs marché", 1), ("Promo", 0), ("Lien", 0)]
+    ths = "".join(f'<th onclick="sortBy({i},{num})">{name} ⇅</th>'
+                  for i, (name, num) in enumerate(heads))
+    now = time.strftime("%d/%m/%Y %H:%M")
+
+    css = """<style>
+*{box-sizing:border-box}
+body{font-family:Arial,sans-serif;background:#1a1a2e;color:#e0e0e0;padding:20px;margin:0}
+.wrap{max-width:1250px;margin:auto}
+h2{color:#f5a623;margin:0 0 4px 0}
+.meta{color:#888;font-size:12px;margin-bottom:14px}
+.controls{display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+input#search{background:#0f3460;color:#eee;border:1px solid #444;padding:6px 10px;border-radius:6px;font-size:13px;width:280px}
+label{font-size:12px;color:#ccc;cursor:pointer;user-select:none}
+table{width:100%;border-collapse:collapse}
+th,td{padding:8px 10px;border-bottom:1px solid #1e2a45;text-align:left;font-size:13px}
+th{background:#0f3460;color:#f5a623;position:sticky;top:0;cursor:pointer;white-space:nowrap}
+tbody tr:hover{background:#152040}
+tr.deal{background:#14231b}tr.deal:hover{background:#183524}
+.price{font-weight:bold;color:#2ecc71}
+.dim{color:#aaa;font-size:12px}
+a{color:#f5a623;text-decoration:none}a:hover{text-decoration:underline}
+</style>"""
+    js = """<script>
+function sortBy(c,num){var tb=document.querySelector('#t tbody'),rs=[].slice.call(tb.rows);
+var asc=tb.getAttribute('data-c')==c&&tb.getAttribute('data-d')=='1';
+tb.setAttribute('data-c',c);tb.setAttribute('data-d',asc?'0':'1');var dir=asc?-1:1;
+rs.sort(function(a,b){var x=a.cells[c].getAttribute('data-v'),y=b.cells[c].getAttribute('data-v');
+if(x==null)x=a.cells[c].innerText;if(y==null)y=b.cells[c].innerText;
+return num?((parseFloat(x)||0)-(parseFloat(y)||0))*dir:(''+x).localeCompare(y)*dir;});
+rs.forEach(function(r){tb.appendChild(r);});}
+function flt(){var q=document.getElementById('search').value.toLowerCase(),only=document.getElementById('dealsOnly').checked,
+rr=document.querySelectorAll('#t tbody tr');for(var i=0;i<rr.length;i++){var r=rr[i];
+r.style.display=((r.innerText.toLowerCase().indexOf(q)>-1)&&(!only||r.getAttribute('data-deal')=='1'))?'':'none';}}
+</script>"""
+
+    html = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>Amazon TCG Plans — {now}</title>{css}</head><body><div class="wrap">
+<h2>🎴 Amazon TCG Plans</h2>
+<div class="meta">{now} — {len(rows)} offres (One Piece + Pokémon, displays) · {len(deals)} deals cross-marché · {promos} en promo · triées par jeu / set / prix</div>
+<div class="controls">
+<input type="text" id="search" placeholder="🔍 Set, titre, jeu, marché..." oninput="flt()">
+<label><input type="checkbox" id="dealsOnly" onchange="flt()"> 🔥 deals seulement</label>
+</div>
+<table id="t"><thead><tr>{ths}</tr></thead><tbody>{tbody}</tbody></table>
+</div>{js}</body></html>"""
     with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
         f.write(html)
-    print(f"[report] {len(deals)} deals → {os.path.basename(OUTPUT_HTML)}")
+    print(f"[report] {len(rows)} offres ({len(deals)} deals) → {os.path.basename(OUTPUT_HTML)}")
 
     # Alerte Telegram optionnelle (réutilise les tokens du bot PREORDER)
     token, chat = os.getenv("TELEGRAM_TOKEN_2"), os.getenv("TELEGRAM_CHAT_ID_2")
